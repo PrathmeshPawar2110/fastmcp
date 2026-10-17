@@ -76,6 +76,7 @@ from typing import (
     TypeVar,
     Union,
     cast,
+    overload,
 )
 from uuid import UUID
 
@@ -354,15 +355,11 @@ def json_schema_to_type(
 
 def _convert_normalized(schema: dict[str, Any], name: str | None) -> type:
     root_hash, root_size = _schema_digest(schema)
-    # `title` can carry any JSON value in a malformed schema; only a string
-    # (including the empty string) is a valid class-name source.
-    title = schema.get("title")
-    root_title = title if isinstance(title, str) else "Root"
     token = _conversion.set(
         _Conversion(
             root_hash=root_hash,
             root_size=root_size,
-            root_class_name=_sanitize_name(name or root_title),
+            root_class_name=_sanitize_name(name or _schema_title(schema, "Root")),
         )
     )
     try:
@@ -696,7 +693,7 @@ def _object_schema_to_type(
     """
     has_properties = bool(schema.get("properties"))
     additional_props = schema.get("additionalProperties")
-    class_name = name if name is not None else schema.get("title")
+    class_name = name if name is not None else _schema_title(schema)
 
     if not has_properties and additional_props:
         if additional_props is True:
@@ -772,7 +769,7 @@ def _convert_schema(
         return object
 
     if "type" not in schema and "properties" in schema:
-        return _create_dataclass(schema, schema.get("title", "<unknown>"), schemas)
+        return _create_dataclass(schema, _schema_title(schema, "<unknown>"), schemas)
 
     # Handle references first
     if "$ref" in schema:
@@ -857,6 +854,20 @@ def _convert_schema(
         return Union[tuple(types)]  # type: ignore # noqa: UP007
 
     return _get_from_type_handler(schema, schemas, resolving_refs)(schema)
+
+
+@overload
+def _schema_title(schema: Mapping[str, Any], default: str) -> str: ...
+@overload
+def _schema_title(schema: Mapping[str, Any], default: None = None) -> str | None: ...
+def _schema_title(schema: Mapping[str, Any], default: str | None = None) -> str | None:
+    """Return the schema's `title` when it can name a class, else `default`.
+
+    `title` can carry any JSON value in a malformed schema; only a string
+    (including the empty string) is a valid class-name source.
+    """
+    title = schema.get("title")
+    return title if isinstance(title, str) else default
 
 
 def _sanitize_name(name: str) -> str:
@@ -990,7 +1001,7 @@ def _create_pydantic_model(
     resolving_refs: frozenset[str] = frozenset(),
 ) -> type:
     """Create Pydantic BaseModel from object schema with additionalProperties."""
-    name = name or schema.get("title", "Root")
+    name = name or _schema_title(schema, "Root")
     if name is None:
         raise ValueError("Name is required")
     sanitized_name = _sanitize_name(name)
@@ -1071,7 +1082,7 @@ def _create_dataclass(
     resolving_refs: frozenset[str] = frozenset(),
 ) -> type:
     """Create dataclass from object schema."""
-    name = name or schema.get("title", "Root")
+    name = name or _schema_title(schema, "Root")
     # Sanitize name for class creation
     if name is None:
         raise ValueError("Name is required")

@@ -409,6 +409,40 @@ class TestCircularReferences:
         root_type = json_schema_to_type(schema)
         assert TypeAdapter(root_type).validate_python(valid_value) == valid_value
 
+    @pytest.mark.parametrize(
+        "additional_properties",
+        [{}, {"additionalProperties": True}, {"additionalProperties": {}}],
+        ids=["dataclass", "extras-allowed", "typed-extras"],
+    )
+    def test_non_string_title_names_generated_classes_root(self, additional_properties):
+        # Generated classes fall back to "Root" for a non-string title, the
+        # same name `"$ref": "#"` resolves to.
+        root_type = json_schema_to_type(
+            {
+                "type": "object",
+                "title": 5,
+                "properties": {
+                    "name": {"type": "string"},
+                    "next": {"anyOf": [{"$ref": "#"}, {"type": "null"}]},
+                    "child": {
+                        "type": "object",
+                        "title": ["not", "a", "name"],
+                        "properties": {"tag": {"type": "string"}},
+                    },
+                },
+                **additional_properties,
+            }
+        )
+        assert root_type.__name__ == "Root"
+
+        validator: TypeAdapter[Any] = TypeAdapter(root_type)
+        node = validator.validate_python(
+            {"name": "a", "next": {"name": "b"}, "child": {"tag": "t"}}
+        )
+        assert isinstance(node.next, root_type)
+        assert node.next.name == "b"
+        assert node.child.tag == "t"
+
     def test_nested_direct_root_reference_points_at_root(self):
         # A direct `"root": {"$ref": "#"}` property on a nested class must
         # reference the conversion root, not the nested class itself.

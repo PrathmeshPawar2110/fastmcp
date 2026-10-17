@@ -234,6 +234,9 @@ class _Conversion:
 
     root_hash: str
     root_size: int
+    # Sanitized name of the class generated for the root schema; `"$ref": "#"`
+    # resolves to that class.
+    root_class_name: str
     resolved_refs: dict[str, Any] = field(default_factory=dict)
     building: set[tuple[str, str]] = field(default_factory=set)
     depth: int = 0
@@ -351,7 +354,17 @@ def json_schema_to_type(
 
 def _convert_normalized(schema: dict[str, Any], name: str | None) -> type:
     root_hash, root_size = _schema_digest(schema)
-    token = _conversion.set(_Conversion(root_hash=root_hash, root_size=root_size))
+    # `title` can carry any JSON value in a malformed schema; only a string
+    # (including the empty string) is a valid class-name source.
+    title = schema.get("title")
+    root_title = title if isinstance(title, str) else "Root"
+    token = _conversion.set(
+        _Conversion(
+            root_hash=root_hash,
+            root_size=root_size,
+            root_class_name=_sanitize_name(name or root_title),
+        )
+    )
     try:
         # Always use the top-level schema for references
         if schema.get("type") == "object":
@@ -674,8 +687,8 @@ def _object_schema_to_type(
     1. No ``properties`` with ``additionalProperties`` truthy — ``dict[str, T]``
        (``T = Any`` when ``additionalProperties is True``, else the value schema's type)
     2. No ``properties`` and no ``additionalProperties`` — ``dict[str, Any]``
-    3. Has ``properties`` and ``additionalProperties is True`` — Pydantic model
-       (so ``extra="allow"`` can preserve unknown keys)
+    3. Has ``properties`` and ``additionalProperties`` is true or a schema —
+       Pydantic model (so extra keys can be preserved and hydrated)
     4. Has ``properties`` otherwise — dataclass
 
     ``name`` is used as the generated class name for cases 3 and 4; it falls
@@ -694,7 +707,9 @@ def _object_schema_to_type(
     if not has_properties and not additional_props:
         return dict[str, Any]
 
-    if has_properties and additional_props is True:
+    if has_properties and (
+        additional_props is True or isinstance(additional_props, Mapping)
+    ):
         return _create_pydantic_model(schema, class_name, schemas, resolving_refs)
 
     return _create_dataclass(schema, class_name, schemas, resolving_refs)
@@ -764,7 +779,7 @@ def _convert_schema(
         ref = schema["$ref"]
         # Handle self-reference
         if ref == "#":
-            return ForwardRef(_sanitize_name(schema.get("title", "Root")))
+            return ForwardRef(_conversion.get().root_class_name)
         if ref in resolving_refs:
             resolved = _resolve_ref(ref, schemas)
             if isinstance(resolved, Mapping) and (
@@ -819,6 +834,16 @@ def _convert_schema(
         # Create a copy of the schema for each type, but keep all constraints
         types: list[type | Any] = []
         for t in schema_type:
+            if t == "object" and schema is schemas:
+                # The root narrowed to its object member: convert the schema
+                # itself, not a copy, so the generated class keeps the root
+                # identity (and name) that "$ref": "#" resolves to.
+                types.append(
+                    _object_schema_to_type(
+                        schema, schemas, resolving_refs=resolving_refs
+                    )
+                )
+                continue
             type_schema = dict(schema)
             type_schema["type"] = t
             types.append(_schema_to_type(type_schema, schemas, resolving_refs))
@@ -875,6 +900,7 @@ def safe_create_model(
     field_definitions: Mapping[str, tuple[Any, Any]],
     *,
     config: ConfigDict | None = None,
+    extra_value_type: Any = None,
 ) -> type[BaseModel]:
     """Create a Pydantic model whose field names come from untrusted input.
 
@@ -887,6 +913,7 @@ def safe_create_model(
         field_definitions: Maps each property name to `(annotation, default)`,
             where `default` may be a `FieldInfo` or `...` for required fields.
         config: Optional model configuration.
+        extra_value_type: Optional annotation for values of additional properties.
     """
     fields: dict[str, Any] = {}
     for prop_name, (annotation, default) in field_definitions.items():
@@ -904,6 +931,8 @@ def safe_create_model(
             else:
                 default = Field(default=default, alias=prop_name)
         fields[field_name] = (annotation, default)
+    if extra_value_type is not None:
+        fields["__pydantic_extra__"] = (dict[str, extra_value_type], Field(init=False))
     return create_model(name, __config__=config, **fields)
 
 
@@ -936,6 +965,24 @@ def _create_field_with_default(
     return field(default=default_value)
 
 
+def _nested_class_name(
+    sanitized_name: str,
+    conversion: _Conversion,
+    schema: Mapping[str, Any],
+    schemas: Mapping[str, Any] | None,
+) -> str:
+    """Disambiguate a nested class named like the conversion root.
+
+    Pydantic resolves a class's annotations with the class's own name bound
+    to that class before the conversion root, so a nested class sharing the
+    root's name would capture every ``"$ref": "#"`` reference inside it.
+    Keep the root name pointing at the root class.
+    """
+    if sanitized_name == conversion.root_class_name and schema is not schemas:
+        return f"{sanitized_name}_2"
+    return sanitized_name
+
+
 def _create_pydantic_model(
     schema: Mapping[str, Any],
     name: str | None = None,
@@ -948,8 +995,15 @@ def _create_pydantic_model(
         raise ValueError("Name is required")
     sanitized_name = _sanitize_name(name)
     conversion = _conversion.get()
+    sanitized_name = _nested_class_name(sanitized_name, conversion, schema, schemas)
     schema_hash = _hash_schema(schema)
-    cache_key = (schema_hash + conversion.root_hash, sanitized_name)
+    # Nested classes bake the root class name into their forward references,
+    # so conversions that differ only in the root's name must not share
+    # cache entries.
+    cache_key = (
+        schema_hash + conversion.root_hash + conversion.root_class_name,
+        sanitized_name,
+    )
 
     # Return existing class if already built
     existing = _classes.get(cache_key)
@@ -998,7 +1052,16 @@ def _build_pydantic_model(
         else:
             field_definitions[prop_name] = (Union[field_type, type(None)], None)  # type: ignore[misc]  # noqa: UP007  # ty:ignore[invalid-type-form]
 
-    return safe_create_model(name, field_definitions, config=ConfigDict(extra="allow"))
+    additional_props = schema.get("additionalProperties")
+    extra_value_type = None
+    if isinstance(additional_props, Mapping):
+        extra_value_type = _schema_to_type(additional_props, schemas, resolving_refs)
+    return safe_create_model(
+        name,
+        field_definitions,
+        config=ConfigDict(extra="allow", validate_default=extra_value_type is not None),
+        extra_value_type=extra_value_type,
+    )
 
 
 def _create_dataclass(
@@ -1014,8 +1077,15 @@ def _create_dataclass(
         raise ValueError("Name is required")
     sanitized_name = _sanitize_name(name)
     conversion = _conversion.get()
+    sanitized_name = _nested_class_name(sanitized_name, conversion, schema, schemas)
     schema_hash = _hash_schema(schema)
-    cache_key = (schema_hash + conversion.root_hash, sanitized_name)
+    # Nested classes bake the root class name into their forward references,
+    # so conversions that differ only in the root's name must not share
+    # cache entries.
+    cache_key = (
+        schema_hash + conversion.root_hash + conversion.root_class_name,
+        sanitized_name,
+    )
 
     # Return existing class if already built
     existing = _classes.get(cache_key)
@@ -1046,7 +1116,8 @@ def _build_dataclass(
     if "$ref" in schema:
         ref = schema["$ref"]
         if ref == "#":
-            return ForwardRef(sanitized_name)
+            # "#" resolves to the conversion root, not to this class.
+            return ForwardRef(_conversion.get().root_class_name)
         if ref in resolving_refs:
             return Any
         schema = _resolve_ref(ref, schemas)
@@ -1074,8 +1145,9 @@ def _build_dataclass(
             field_type = _schema_to_type(prop_schema, schemas, resolving_refs)
             prop_schema = {}
         elif prop_schema.get("$ref") == "#":
-            # Check for self-reference in property
-            field_type = ForwardRef(sanitized_name)
+            # A direct "#" reference points at the conversion root, which
+            # may be a different class than the one being built here.
+            field_type = ForwardRef(_conversion.get().root_class_name)
         else:
             field_type = _schema_to_type(prop_schema, schemas, resolving_refs)
 

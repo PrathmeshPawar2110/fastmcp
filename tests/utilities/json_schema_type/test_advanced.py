@@ -443,6 +443,47 @@ class TestCircularReferences:
         assert node.next.name == "b"
         assert node.child.tag == "t"
 
+    @pytest.mark.parametrize(
+        "root",
+        [
+            pytest.param(
+                {"anyOf": [{"$ref": "#/$defs/Node"}, {"type": "null"}]},
+                id="nullable-union",
+            ),
+            pytest.param(
+                {"title": "Wrapper", "anyOf": [{"$ref": "#/$defs/Node"}]},
+                id="titled-union",
+            ),
+            pytest.param({"$ref": "#/$defs/Node"}, id="ref"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "next_schema",
+        [
+            pytest.param({"anyOf": [{"$ref": "#"}, {"type": "null"}]}, id="union"),
+            pytest.param({"$ref": "#"}, id="direct"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "extras",
+        [{}, {"additionalProperties": {"type": "integer"}}],
+        ids=["dataclass", "typed-extras"],
+    )
+    def test_wrapper_root_self_reference_resolves(self, root, next_schema, extras):
+        # A root that is not itself an object generates no root class, so
+        # "#" binds to the object it wraps rather than to a missing class.
+        node = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "next": next_schema},
+            **extras,
+        }
+        root_type = json_schema_to_type({**root, "$defs": {"Node": node}})
+
+        validator: TypeAdapter[Any] = TypeAdapter(root_type)
+        result = validator.validate_python({"name": "a", "next": {"name": "b"}})
+        assert result.next.name == "b"
+        assert type(result.next) is type(result)
+
     def test_nested_direct_root_reference_points_at_root(self):
         # A direct `"root": {"$ref": "#"}` property on a nested class must
         # reference the conversion root, not the nested class itself.

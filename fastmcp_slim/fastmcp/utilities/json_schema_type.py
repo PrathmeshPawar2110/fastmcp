@@ -237,8 +237,10 @@ class _Conversion:
     root_size: int
     # Sanitized name of the class generated for the root schema; `"$ref": "#"`
     # resolves to that class. None when the root converts to something other
-    # than a class (a union, a `$ref`, a dict), where "#" keeps binding by name.
+    # than a class (a union, a `$ref`, a dict), where "#" binds to the enclosing
+    # class being built instead.
     root_class_name: str | None
+    enclosing_class_name: str | None = None
     resolved_refs: dict[str, Any] = field(default_factory=dict)
     building: set[tuple[str, str]] = field(default_factory=set)
     depth: int = 0
@@ -792,8 +794,10 @@ def _convert_schema(
         ref = schema["$ref"]
         # Handle self-reference
         if ref == "#":
+            conversion = _conversion.get()
             return ForwardRef(
-                _conversion.get().root_class_name
+                conversion.root_class_name
+                or conversion.enclosing_class_name
                 or _sanitize_name(_schema_title(schema, "Root"))
             )
         if ref in resolving_refs:
@@ -1044,11 +1048,14 @@ def _create_pydantic_model(
         return ForwardRef(sanitized_name)  # type: ignore[return-value]  # ty:ignore[invalid-return-type]
 
     conversion.building.add(cache_key)
+    enclosing_class_name = conversion.enclosing_class_name
+    conversion.enclosing_class_name = sanitized_name
     try:
         cls = _build_pydantic_model(
             schema, sanitized_name, schemas or {}, resolving_refs
         )
     finally:
+        conversion.enclosing_class_name = enclosing_class_name
         conversion.building.discard(cache_key)
     _classes.put(cache_key, cls, conversion.root_size)
     return cls
@@ -1070,6 +1077,8 @@ def _build_pydantic_model(
         if isinstance(prop_schema, bool):
             field_type = _schema_to_type(prop_schema, schemas, resolving_refs)
             prop_schema = {}
+        elif prop_schema.get("$ref") == "#":
+            field_type = ForwardRef(_conversion.get().root_class_name or name)
         else:
             field_type = _schema_to_type(prop_schema, schemas, resolving_refs)
 
@@ -1126,9 +1135,12 @@ def _create_dataclass(
         return ForwardRef(sanitized_name)  # type: ignore[return-value]  # ty:ignore[invalid-return-type]
 
     conversion.building.add(cache_key)
+    enclosing_class_name = conversion.enclosing_class_name
+    conversion.enclosing_class_name = sanitized_name
     try:
         cls = _build_dataclass(schema, sanitized_name, schemas or {}, resolving_refs)
     finally:
+        conversion.enclosing_class_name = enclosing_class_name
         conversion.building.discard(cache_key)
     if isinstance(cls, type):
         _classes.put(cache_key, cls, conversion.root_size)

@@ -124,6 +124,8 @@ transport = StreamableHttpTransport(
 client = Client(transport)
 ```
 
+The same field is available as `max_sse_event_size` on an [MCP config](/integrations/mcp-json-configuration)'s remote server entry, which forwards it when building the transport. A client created from a bare URL (`Client("https://api.example.com/mcp")`) keeps the 1 MiB default; pass an explicit `StreamableHttpTransport` as above to raise or disable it.
+
 ```python
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport

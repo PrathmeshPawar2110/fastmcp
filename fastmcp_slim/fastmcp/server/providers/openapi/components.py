@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +11,7 @@ import httpx2
 from mcp_types import ToolAnnotations
 from pydantic.networks import AnyUrl
 
+from fastmcp.exceptions import ValidationError
 from fastmcp.resources import (
     Resource,
     ResourceContent,
@@ -18,10 +20,11 @@ from fastmcp.resources import (
 )
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.tools.base import Tool, ToolResult
+from fastmcp.tools.function_tool import _strict_input_validation
 from fastmcp.utilities.exceptions import is_request_error, is_timeout_error
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.openapi import HTTPRoute
-from fastmcp.utilities.openapi.director import RequestDirector
+from fastmcp.utilities.openapi.director import RequestDirector, _prepare_parameter_map
 from fastmcp.utilities.tasks import TaskConfig
 
 if TYPE_CHECKING:
@@ -57,25 +60,43 @@ logger = get_logger(__name__)
 
 # Default MIME type when no response content type can be inferred
 _DEFAULT_MIME_TYPE = "application/json"
+_ERROR_BODY_LIMIT = 1000
+_ERROR_BODY_TRUNCATION = "… (truncated)"
+
+
+def _bounded_error_body(body: str) -> str:
+    """Limit upstream error text included in a tool error."""
+    if len(body) <= _ERROR_BODY_LIMIT:
+        return body
+    return body[:_ERROR_BODY_LIMIT] + _ERROR_BODY_TRUNCATION
 
 
 def _raise_for_status(response: httpx2.Response) -> None:
-    """Raise an OpenAPI-formatted error without relying on client exception types.
-
-    The error is an `httpx2.HTTPStatusError` whatever library the client
-    belongs to, so the server can recognize an upstream error response by its
-    status code.
-    """
+    """Raise an OpenAPI-formatted error with concise upstream details."""
     if 200 <= response.status_code < 300:
         return
 
     error_message = f"HTTP error {response.status_code}: {response.reason_phrase}"
-    try:
-        error_data = response.json()
-        error_message += f" - {error_data}"
-    except (json.JSONDecodeError, ValueError):
-        if response.text:
-            error_message += f" - {response.text}"
+    headers = getattr(response, "headers", {})
+    if 300 <= response.status_code < 400:
+        location = headers.get("location")
+        if location:
+            error_message += f" - Location: {location}"
+
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    body = getattr(response, "text", "")
+    is_html = content_type in {"text/html", "application/xhtml+xml"}
+    if body and not is_html:
+        try:
+            error_data = response.json()
+        except (json.JSONDecodeError, ValueError):
+            # Some upstreams omit Content-Type, so avoid forwarding obvious HTML.
+            if not body.lstrip().lower().startswith(("<!doctype html", "<html")):
+                error_message += f" - {_bounded_error_body(body)}"
+        else:
+            error_message += (
+                f" - {_bounded_error_body(json.dumps(error_data, ensure_ascii=False))}"
+            )
     raise httpx2.HTTPStatusError(
         error_message, request=response.request, response=response
     )
@@ -203,6 +224,17 @@ class OpenAPITool(Tool):
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the HTTP request using RequestDirector."""
+        # The director drops arguments outside its parameter map; strict
+        # servers reject them instead, using the same key set.
+        if _strict_input_validation():
+            _, parameter_map = _prepare_parameter_map(self._route)
+            accepted = {*self.parameters.get("properties", {}), *parameter_map}
+            if unknown := sorted(arguments.keys() - accepted):
+                raise ValidationError(
+                    f"Unknown arguments: {', '.join(unknown)}. "
+                    f"Accepted: {', '.join(sorted(accepted)) or 'none'}",
+                    log_level=logging.WARNING,
+                )
         # Build the request — errors here are programming/schema issues,
         # not HTTP failures, so we catch them separately.
         try:
